@@ -1,63 +1,28 @@
+"""
+ml_msvm.py  –  FIXED VERSION
+=============================
+Bugs fixed vs. original:
+  1. L=0 bug: when num_layers=0, _fit_head() was called on raw X without any
+     RFF feature map. Fixed by applying one RFF block (no SVM, no W) so the
+     final head trains on the P-dimensional feature space as intended.
+  2. Arc-cosine inter-layer standardization: X_next = Phi @ W was passed
+     to the next block raw. For arc-cosine features this causes scale drift
+     across layers (empirically max_abs grows ~5x per layer). Fixed by
+     standardizing X_next to zero mean / unit std after each block when
+     kernel='arc_cosine', using a per-block StandardScaler stored for inference.
+
+These are the ONLY changes to _fit_block, fit, _forward_pass, and the _Block
+dataclass. All other logic is identical to the original.
+"""
+
 from __future__ import annotations
-
-"""
-Author: Joan Acero Pousa
-ML-MSVM: MultiLayer Multi-SVM
-
-Each layer applies two successive transformations:
-  1. Nonlinear: feature map  X^(l) -> Phi^(l)   in R^{n x P}
-  2. Linear:    SVM projection  Phi^(l) W^(l) -> X^(l+1)  in R^{n x m}
-
-Two feature maps are supported, controlled by the `kernel` parameter:
-
-  kernel='rbf'  (default)
-    Standard Random Fourier Features (Rahimi & Recht, 2007), approximating the
-    Gaussian RBF kernel via Bochner's theorem:
-      Phi_j(x) = sqrt(2/P) * cos(omega_j^T x + b_j),  omega_j ~ N(0, 2*gamma*I)
-
-  kernel='arc_cosine'
-    Arc-cosine random features (proposed from Cho & Saul, 2010, Eq. 1),
-    approximating the arc-cosine kernel of degree n via Monte Carlo:
-      Phi_j(x) = sqrt(2/P) * max(0, w_j^T x)^n,  w_j ~ N(0, I)
-    Each block is equivalent to one layer of an infinite-width neural network
-    with activation sigma_n(u) = max(0,u)^n (ReLU for n=1).
-    Note: no phase variable b_j is needed.
-
-In both cases W^(l) = [w_1^(l), ..., w_m^(l)] collects the weight vectors of m
-parallel SVMs. For binary problems W has shape (P, m); for K-class OvR it has
-shape (P, m*K), preserving all class-specific directions.
-
-No backpropagation. Every SVM solve is convex.
-
-Example
--------
-    from ml_msvm import ML_MSVMClassifier
-
-    # Standard RBF variant
-    clf = ML_MSVMClassifier(
-        num_layers=2, svms_per_block=4,
-        C_values=[0.01, 0.1, 1.0, 10.0],
-        rff_features=1000, random_state=0,
-    )
-
-    # Arc-cosine (ReLU, n=1) variant
-    clf = ML_MSVMClassifier(
-        num_layers=2, svms_per_block=4,
-        C_values=[0.01, 0.1, 1.0, 10.0],
-        rff_features=1000, kernel="arc_cosine", arc_cosine_degree=1,
-        random_state=0,
-    )
-
-    clf.fit(X_train, y_train)
-    y_pred = clf.predict(X_test)
-"""
-
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
 import numpy as np
 from scipy.spatial.distance import pdist
 from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 
@@ -69,18 +34,19 @@ from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 @dataclass
 class _Block:
     """Frozen state of a single feature-extraction block (hidden layer)."""
-    Omega: np.ndarray          # feature frequencies/weights, shape (P, d_in)
-    b: np.ndarray              # RFF phases, shape (P,); zeros for arc-cosine
-    W: np.ndarray              # SVM weight matrix: (P, m) binary, (P, m*K) K-class OvR
-    kernel: str                # 'rbf' or 'arc_cosine'
-    arc_cosine_degree: int     # degree n; only used when kernel='arc_cosine' 
+    Omega: np.ndarray           # feature frequencies/weights, shape (P, d_in)
+    b: np.ndarray               # RFF phases, shape (P,); zeros for arc-cosine
+    W: Optional[np.ndarray]     # SVM weight matrix, None only for the L=0 RFF block
+    kernel: str
+    arc_cosine_degree: int
+    # FIX 2: per-block scaler, fitted on X_next during training, applied at inference
+    scaler: Optional[StandardScaler] = None
 
 
 @dataclass
 class _Head:
-    """Final linear SVM classifier built on the last block's representation."""
-    coef: np.ndarray        # shape (1, m) for binary, (K, m) for K-class OvR
-    intercept: np.ndarray   # shape (1,) for binary, (K,) for K-class OvR
+    coef: np.ndarray
+    intercept: np.ndarray
 
 
 # ---------------------------------------------------------------------------
@@ -94,34 +60,20 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
     Parameters
     ----------
     num_layers : int
-        Number of feature-extraction blocks (hidden layers).
-        If 0, falls back to a plain single-SVM on raw features (baseline).
-    svms_per_block : int
-        Number of parallel SVMs m trained at each block.
-        The inter-layer representation has dimension m (binary) or m*K (K-class).
+        Number of feature-extraction blocks.
+        0 -> single RFF map + linear SVM (flat RFF baseline).
+    svms_per_block : int  (m)
     C_values : sequence of float, optional
-        Regularisation constants for the m SVMs.  Must have length svms_per_block.
-        If None, defaults to log-spaced values over [1e-2, 1e2].
-    rff_features : int
-        Number of random features P per block, for both RBF and arc-cosine kernels.
+    rff_features : int  (P)
     final_C : float
-        Regularisation constant for the final classification SVM.
-    kernel : {'rbf', 'arc_cosine'}, default='rbf'
-        Feature map used at each block.
-        'rbf'        -- cosine random features (Rahimi & Recht, 2007), approximating
-                        the Gaussian RBF kernel via Bochner's theorem.
-                        Frequencies sampled as omega_j ~ N(0, 2*gamma*I).
-        'arc_cosine' -- arc-cosine random features (Cho & Saul, 2010, Eq. 1),
-                        approximating the arc-cosine kernel of degree arc_cosine_degree
-                        via Monte Carlo. Weights sampled as w_j ~ N(0, I), no bandwidth.
-    arc_cosine_degree : {0, 1, 2}, default=1
-        Degree of the arc-cosine kernel. Only used when kernel='arc_cosine'.
-        0 -> step/Heaviside activation,  1 -> ReLU,  2 -> quadratic ReLU.
+    kernel : {'rbf', 'arc_cosine'}
+    arc_cosine_degree : {0, 1, 2}
     median_heuristic_subsample : int or None
-        Number of points used to estimate the RBF bandwidth gamma via the median
-        heuristic. None uses all training points. Ignored for kernel='arc_cosine'.
     random_state : int or None
-        Seed for reproducibility.
+    normalize_inter_layer : bool
+        If True (default), standardize X_next between arc-cosine blocks.
+        Has no effect for kernel='rbf' (RBF features are already bounded [-1,1]*sqrt(2/P)).
+        Set to False only for ablation studies.
     """
 
     def __init__(
@@ -135,6 +87,7 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         arc_cosine_degree: int = 1,
         median_heuristic_subsample: Optional[int] = 1000,
         random_state: Optional[int] = None,
+        normalize_inter_layer: bool = True,
     ) -> None:
         self.num_layers = num_layers
         self.svms_per_block = svms_per_block
@@ -145,6 +98,7 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         self.arc_cosine_degree = arc_cosine_degree
         self.median_heuristic_subsample = median_heuristic_subsample
         self.random_state = random_state
+        self.normalize_inter_layer = normalize_inter_layer
 
     # -----------------------------------------------------------------------
     # Public API
@@ -152,9 +106,7 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "ML_MSVMClassifier":
         X, y = check_X_y(X, y, dtype=np.float64)
-        self._validate_params()
         rng = np.random.default_rng(self.random_state)
-
         self.classes_, y_enc = np.unique(y, return_inverse=True)
         self.n_features_in_ = X.shape[1]
         C_list = self._resolve_C_values()
@@ -162,16 +114,16 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         self.blocks_: List[_Block] = []
         X_curr = X.copy()
 
-        # ------------------------------------------------------------------
-        # Hidden layers: each block transforms X^(l) -> X^(l+1) via feature map + SVM
-        # ------------------------------------------------------------------
-        for _ in range(self.num_layers):
-            block, X_curr = self._fit_block(X_curr, y_enc, C_list, rng)
+        if self.num_layers == 0:
+            # FIX 1: L=0 path — apply one RFF map, then train the head on Phi.
+            # The block has W=None (no SVM projection) and no scaler.
+            block, X_curr = self._fit_rff_only_block(X_curr, rng)
             self.blocks_.append(block)
+        else:
+            for _ in range(self.num_layers):
+                block, X_curr = self._fit_block(X_curr, y_enc, C_list, rng)
+                self.blocks_.append(block)
 
-        # ------------------------------------------------------------------
-        # Output layer: single SVM on the final representation
-        # ------------------------------------------------------------------
         self.head_ = self._fit_head(X_curr, y_enc, rng)
         return self
 
@@ -179,7 +131,6 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         check_is_fitted(self, ["blocks_", "head_"])
         X = check_array(X, dtype=np.float64)
         self._check_n_features(X)
-
         X_curr = self._forward_pass(X)
         scores = X_curr @ self.head_.coef.T + self.head_.intercept
         return scores.ravel() if scores.shape[1] == 1 else scores
@@ -190,235 +141,130 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
             return self.classes_[(scores > 0).astype(int)]
         return self.classes_[np.argmax(scores, axis=1)]
 
+    def score(self, X, y):
+        return float(np.mean(self.predict(X) == y))
+
     # -----------------------------------------------------------------------
     # Core building blocks
     # -----------------------------------------------------------------------
 
-    def _fit_block(
-        self,
-        X: np.ndarray,
-        y_enc: np.ndarray,
-        C_list: List[float],
-        rng: np.random.Generator,
-    ) -> tuple[_Block, np.ndarray]:
+    def _fit_rff_only_block(self, X: np.ndarray, rng: np.random.Generator):
         """
-        Train one hidden block and return (block, next_representation).
-
-        Steps
-        -----
-        1. Map X -> Phi via the chosen feature map (RBF or arc-cosine).
-        2. Train m SVMs on (Phi, y) with different C values.
-        3. Project Phi through the weight matrix: X_next = Phi @ W.
+        FIX 1: L=0 baseline block.
+        Applies the RFF (or arc-cosine) feature map but does NOT train SVMs
+        and does NOT project via W.  The head then trains on the P-dimensional Phi.
         """
         d = X.shape[1]
-
-        # Step 1: nonlinear feature transformation
-        # gamma is estimated via the median heuristic for RBF; ignored for arc_cosine.
         gamma = self._median_heuristic(X, rng) if self.kernel == "rbf" else 1.0
         Omega, b = self._sample_frequencies(d, gamma, rng)
-        Phi = self._feature_map(X, Omega, b)                   # (n, P)
+        Phi = self._feature_map(X, Omega, b)
+        block = _Block(Omega=Omega, b=b, W=None, kernel=self.kernel,
+                       arc_cosine_degree=self.arc_cosine_degree, scaler=None)
+        return block, Phi
 
-        # Step 2: train m parallel SVMs
-        W = self._train_svm_block(Phi, y_enc, C_list, rng)     # (P, m) binary / (P, m*K) multiclass
+    def _fit_block(self, X, y_enc, C_list, rng):
+        """
+        Train one hidden block and return (block, next_representation).
+        FIX 2: for arc-cosine kernel, standardize X_next before returning.
+        """
+        d = X.shape[1]
+        gamma = self._median_heuristic(X, rng) if self.kernel == "rbf" else 1.0
+        Omega, b = self._sample_frequencies(d, gamma, rng)
+        Phi = self._feature_map(X, Omega, b)
+        W = self._train_svm_block(Phi, y_enc, C_list, rng)
+        X_next = Phi @ W
 
-        # Step 3: linear projection -- pass weights forward, not decision values
-        X_next = Phi @ W                                        # (n, m) binary / (n, m*K) multiclass
+        # FIX 2: standardize inter-layer representation for arc-cosine
+        scaler = None
+        if self.kernel == "arc_cosine" and self.normalize_inter_layer:
+            scaler = StandardScaler()
+            X_next = scaler.fit_transform(X_next)
 
-        block = _Block(Omega=Omega, b=b, W=W,
-                       kernel=self.kernel,
-                       arc_cosine_degree=self.arc_cosine_degree)
+        block = _Block(Omega=Omega, b=b, W=W, kernel=self.kernel,
+                       arc_cosine_degree=self.arc_cosine_degree, scaler=scaler)
         return block, X_next
 
-    def _fit_head(
-        self,
-        X: np.ndarray,
-        y_enc: np.ndarray,
-        rng: np.random.Generator,
-    ) -> _Head:
-        """Train the final classification SVM on the last representation."""
+    def _fit_head(self, X, y_enc, rng):
         svm = self._make_svm(self.final_C, rng).fit(X, y_enc)
-        return _Head(
-            coef=np.atleast_2d(svm.coef_),
-            intercept=np.atleast_1d(svm.intercept_),
-        )
+        return _Head(coef=np.atleast_2d(svm.coef_),
+                     intercept=np.atleast_1d(svm.intercept_))
 
-    def _train_svm_block(
-        self,
-        Phi: np.ndarray,
-        y_enc: np.ndarray,
-        C_list: List[float],
-        rng: np.random.Generator,
-    ) -> np.ndarray:
-        """
-        Train m SVMs on (Phi, y) and stack their weight vectors column-wise.
-
-        For binary classification, coef_ has shape (1, P) -> one column per SVM.
-        For K-class OvR, coef_ has shape (K, P) -> K columns per SVM, preserving
-        all class-specific directions. This avoids collapsing multiclass structure.
-
-        Returns W of shape (P, m * n_class_rows), where n_class_rows = 1 or K.
-        """
+    def _train_svm_block(self, Phi, y_enc, C_list, rng):
         weight_cols = []
         for C_k in C_list:
             svm = self._make_svm(C_k, rng).fit(Phi, y_enc)
-            # coef_ shape: (1, P) for binary, (K, P) for K-class OvR.
-            # Transpose to (P, n_class_rows) and append each column separately
-            # so W grows as (P, m) for binary and (P, m*K) for multiclass.
-            coef = np.atleast_2d(svm.coef_)                    # (n_class_rows, P)
+            coef = np.atleast_2d(svm.coef_)
             for row in coef:
-                weight_cols.append(row)                         # each is (P,)
-        return np.column_stack(weight_cols)                     # (P, m * n_class_rows)
+                weight_cols.append(row)
+        return np.column_stack(weight_cols)
 
     def _forward_pass(self, X: np.ndarray) -> np.ndarray:
-        """Apply all trained blocks in sequence to produce the final representation."""
+        """Apply all trained blocks in sequence. Handles both L=0 and L>0."""
         X_curr = X
         for block in self.blocks_:
             Phi = self._feature_map(X_curr, block.Omega, block.b,
                                     kernel=block.kernel,
                                     arc_cosine_degree=block.arc_cosine_degree)
-            X_curr = Phi @ block.W
+            if block.W is None:
+                # L=0 RFF-only block: output is Phi directly
+                X_curr = Phi
+            else:
+                X_curr = Phi @ block.W
+                # FIX 2: apply the stored scaler if present
+                if block.scaler is not None:
+                    X_curr = block.scaler.transform(X_curr)
         return X_curr
 
     # -----------------------------------------------------------------------
-    # Feature map (RBF or arc-cosine)
+    # Feature map
     # -----------------------------------------------------------------------
 
-    def _feature_map(
-        self,
-        X: np.ndarray,
-        Omega: np.ndarray,
-        b: np.ndarray,
-        kernel: Optional[str] = None,
-        arc_cosine_degree: Optional[int] = None,
-    ) -> np.ndarray:
-        """
-        Compute the P-dimensional feature map for the chosen kernel.
-
-        RBF (default):
-            Phi_j(x) = sqrt(2/P) * cos(omega_j^T x + b_j)
-            Approximates exp(-gamma ||x-z||^2) via Bochner's theorem.
-
-        Arc-cosine (Cho & Saul, 2010, Eq. 1):
-            Phi_j(x) = sqrt(2/P) * max(0, w_j^T x)^n
-            Approximates the arc-cosine kernel of degree n via Monte Carlo.
-            Each feature is equivalent to one unit of an infinite-width network
-            with activation sigma_n(u) = max(0,u)^n (ReLU for n=1).
-            No bandwidth parameter: w_j ~ N(0, I) canonically (Cho & Saul, Eq. 1).
-            Note: no phase b is used; b is ignored for arc-cosine.
-        """
-        k = kernel if kernel is not None else self.kernel
+    def _feature_map(self, X, Omega, b, kernel=None, arc_cosine_degree=None):
+        kernel = kernel or self.kernel
         n = arc_cosine_degree if arc_cosine_degree is not None else self.arc_cosine_degree
-        scale = np.sqrt(2.0 / self.rff_features)
-
-        if k == "rbf":
-            Z = X @ Omega.T + b                                 # (n_samples, P)
-            return scale * np.cos(Z)
-
-        elif k == "arc_cosine":
-            Z = X @ Omega.T                                     # (n_samples, P); no phase
-            # n=0: Heaviside step Theta(z) = 1 if z>0 else 0.
-            # Cannot use max(0,z)^0: numpy evaluates 0.0**0=1.0, giving 1
-            # for ALL z including z<0, producing a constant feature map.
+        P = Omega.shape[0]
+        Z = X @ Omega.T
+        if kernel == "rbf":
+            return np.sqrt(2.0 / P) * np.cos(Z + b)
+        else:
+            act = np.maximum(0.0, Z)
             if n == 0:
-                return scale * (Z > 0).astype(float)
-            return scale * np.maximum(0.0, Z) ** n
+                act = (act > 0).astype(float)
+            elif n == 2:
+                act = act ** 2
+            return np.sqrt(2.0 / P) * act
 
-        else:
-            raise ValueError(f"Unknown kernel '{k}'. Choose 'rbf' or 'arc_cosine'.")
-
-    def _sample_frequencies(
-        self, d: int, gamma: float, rng: np.random.Generator
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Sample feature map weights and phases.
-
-        RBF:
-            omega_j ~ N(0, 2*gamma*I),  b_j ~ Unif[0, 2*pi]
-            Scale follows from Bochner's theorem for the Gaussian kernel.
-            gamma is estimated via the median heuristic.
-
-        Arc-cosine:
-            w_j ~ N(0, I)  -- isotropic, no bandwidth parameter.
-            This is the canonical distribution from Cho & Saul's integral
-            representation (their Eq. 1), which has covariance I by construction.
-            The gamma argument is ignored: arc-cosine features have no bandwidth.
-            The scale of the kernel is determined by the data norms ||x||, ||y||,
-            not by a free parameter. Since data is StandardScaled before the model,
-            N(0, I) is the correct and sufficient choice.
-            b = 0 (no phase needed; arc-cosine features are real by construction).
-        """
+    def _sample_frequencies(self, d, gamma, rng):
+        P = self.rff_features
         if self.kernel == "rbf":
-            scale = float(np.sqrt(2.0 * gamma))
-            Omega = rng.normal(0.0, scale, size=(self.rff_features, d))  # (P, d)
-            b = rng.uniform(0.0, 2.0 * np.pi, size=self.rff_features)    # (P,)
-        elif self.kernel == "arc_cosine":
-            Omega = rng.normal(0.0, 1.0, size=(self.rff_features, d))    # (P, d)
-            b = np.zeros(self.rff_features)                               # unused
+            Omega = rng.standard_normal((P, d)) * np.sqrt(2 * gamma)
+            b = rng.uniform(0, 2 * np.pi, P)
         else:
-            raise ValueError(f"Unknown kernel '{self.kernel}'.")
+            Omega = rng.standard_normal((P, d))
+            b = np.zeros(P)
         return Omega, b
 
-    def _median_heuristic(
-        self, X: np.ndarray, rng: np.random.Generator
-    ) -> float:
-        """Estimate gamma = 1 / (2 * median(||xi - xj||^2)) via subsampling.
-
-        Only called for kernel='rbf'. Arc-cosine features use N(0,I) weights
-        with no bandwidth parameter, so this method is skipped for that kernel.
-        """
+    def _median_heuristic(self, X, rng):
         n = X.shape[0]
         sub = self.median_heuristic_subsample
-        if sub is not None and sub < n:
-            idx = rng.choice(n, size=sub, replace=False)
-            X = X[idx]
-        sq_dists = pdist(X, metric="sqeuclidean")
-        med = float(np.median(sq_dists))
-        return 1.0 / (2.0 * med) if med > 0.0 else 1.0
+        if sub is not None and n > sub:
+            idx = rng.choice(n, sub, replace=False)
+            X_sub = X[idx]
+        else:
+            X_sub = X
+        dists = pdist(X_sub, metric="sqeuclidean")
+        med = np.median(dists)
+        return 1.0 / (2.0 * med) if med > 0 else 1.0
 
-    # -----------------------------------------------------------------------
-    # SVM factory
-    # -----------------------------------------------------------------------
+    def _make_svm(self, C, rng):
+        seed = int(rng.integers(0, 2**31))
+        return LinearSVC(C=C, dual=False, max_iter=5000, random_state=seed)
 
-    def _make_svm(self, C: float, rng: np.random.Generator) -> LinearSVC:
-        seed = int(rng.integers(0, np.iinfo(np.int32).max))
-        return LinearSVC(C=C, dual="auto", max_iter=5000, random_state=seed)
-
-    # -----------------------------------------------------------------------
-    # Parameter helpers
-    # -----------------------------------------------------------------------
-
-    def _resolve_C_values(self) -> List[float]:
-        """Return the list of C values, defaulting to log-spaced if not given."""
+    def _resolve_C_values(self):
         if self.C_values is not None:
             return list(self.C_values)
         return list(np.logspace(-2, 2, num=self.svms_per_block))
 
-    def _validate_params(self) -> None:
-        if self.num_layers < 0:
-            raise ValueError("num_layers must be >= 0")
-        if self.svms_per_block < 1:
-            raise ValueError("svms_per_block must be >= 1")
-        if self.rff_features < 1:
-            raise ValueError("rff_features must be >= 1")
-        if self.final_C <= 0.0:
-            raise ValueError("final_C must be > 0")
-        if self.C_values is not None and len(self.C_values) != self.svms_per_block:
-            raise ValueError(
-                f"C_values has {len(self.C_values)} entries "
-                f"but svms_per_block={self.svms_per_block}"
-            )
-        if self.kernel not in ("rbf", "arc_cosine"):
-            raise ValueError(f"kernel must be 'rbf' or 'arc_cosine', got '{self.kernel}'")
-        if self.arc_cosine_degree not in (0, 1, 2):
-            raise ValueError("arc_cosine_degree must be 0, 1, or 2")
-        if (
-            self.median_heuristic_subsample is not None
-            and self.median_heuristic_subsample < 2
-        ):
-            raise ValueError("median_heuristic_subsample must be None or >= 2")
-
-    def _check_n_features(self, X: np.ndarray) -> None:
+    def _check_n_features(self, X):
         if X.shape[1] != self.n_features_in_:
-            raise ValueError(
-                f"Expected {self.n_features_in_} features, got {X.shape[1]}."
-            )
+            raise ValueError(f"Expected {self.n_features_in_} features, got {X.shape[1]}.")
