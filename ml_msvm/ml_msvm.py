@@ -172,7 +172,9 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         svm = self._make_svm(self.final_C, rng).fit(X, y_enc)
         return _Head(coef=np.atleast_2d(svm.coef_),
                      intercept=np.atleast_1d(svm.intercept_))
-
+ck(Omega=Omega, b=b, W=W, kernel=self.kernel,
+                       arc_cosine_degree=self.arc_cosine_degree,
+                       scaler=scaler, phi_scaler=phi_scaler)
     def _train_svm_block(self, Phi, y_enc, C_list, rng):
         weight_cols = []
         for C_k in C_list:
