@@ -1,22 +1,15 @@
 """
-ml_msvm.py  –  FIXED VERSION
-=============================
-Bugs fixed vs. original:
-  1. L=0 bug: when num_layers=0, _fit_head() was called on raw X without any
-     RFF feature map. Fixed by applying one RFF block (no SVM, no W) so the
-     final head trains on the P-dimensional feature space as intended.
-  2. Arc-cosine inter-layer standardization: X_next = Phi @ W was passed
-     to the next block raw. For arc-cosine features this causes scale drift
-     across layers (empirically max_abs grows ~5x per layer). Fixed by
-     standardizing X_next to zero mean / unit std after each block when
-     kernel='arc_cosine', using a per-block StandardScaler stored for inference.
-
-These are the ONLY changes to _fit_block, fit, _forward_pass, and the _Block
-dataclass. All other logic is identical to the original.
+ml_msvm.py — PATCHED VERSION
+Fixes applied:
+  1. (existing) L=0 bug: _fit_rff_only_block
+  2. (existing) Arc-cosine inter-layer standardization (normalize X_next)
+  3. (NEW) Arc-cosine Phi normalization before block SVM: prevents TRON
+     from hitting max_iter on ill-conditioned non-negative features.
+     Root cause of ArcCos O(n^2.7) timing on MNIST at n > 5k.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import numpy as np
@@ -27,20 +20,15 @@ from sklearn.svm import LinearSVC
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 
 
-# ---------------------------------------------------------------------------
-# Data containers
-# ---------------------------------------------------------------------------
-
 @dataclass
 class _Block:
-    """Frozen state of a single feature-extraction block (hidden layer)."""
-    Omega: np.ndarray           # feature frequencies/weights, shape (P, d_in)
-    b: np.ndarray               # RFF phases, shape (P,); zeros for arc-cosine
-    W: Optional[np.ndarray]     # SVM weight matrix, None only for the L=0 RFF block
+    Omega: np.ndarray
+    b: np.ndarray
+    W: Optional[np.ndarray]
     kernel: str
     arc_cosine_degree: int
-    # FIX 2: per-block scaler, fitted on X_next during training, applied at inference
-    scaler: Optional[StandardScaler] = None
+    scaler: Optional[StandardScaler] = None       # FIX 2: inter-layer scaler
+    phi_scaler: Optional[StandardScaler] = None   # FIX 3: pre-SVM Phi scaler
 
 
 @dataclass
@@ -49,10 +37,6 @@ class _Head:
     intercept: np.ndarray
 
 
-# ---------------------------------------------------------------------------
-# Classifier
-# ---------------------------------------------------------------------------
-
 class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
     """
     MultiLayer Multi-SVM classifier (Proposal 2, no AGOP).
@@ -60,8 +44,7 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
     Parameters
     ----------
     num_layers : int
-        Number of feature-extraction blocks.
-        0 -> single RFF map + linear SVM (flat RFF baseline).
+        0 -> flat RFF SVM baseline.
     svms_per_block : int  (m)
     C_values : sequence of float, optional
     rff_features : int  (P)
@@ -71,9 +54,7 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
     median_heuristic_subsample : int or None
     random_state : int or None
     normalize_inter_layer : bool
-        If True (default), standardize X_next between arc-cosine blocks.
-        Has no effect for kernel='rbf' (RBF features are already bounded [-1,1]*sqrt(2/P)).
-        Set to False only for ablation studies.
+        Standardize X_next between arc-cosine blocks (FIX 2).
     """
 
     def __init__(
@@ -100,10 +81,6 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         self.random_state = random_state
         self.normalize_inter_layer = normalize_inter_layer
 
-    # -----------------------------------------------------------------------
-    # Public API
-    # -----------------------------------------------------------------------
-
     def fit(self, X: np.ndarray, y: np.ndarray) -> "ML_MSVMClassifier":
         X, y = check_X_y(X, y, dtype=np.float64)
         rng = np.random.default_rng(self.random_state)
@@ -115,8 +92,6 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         X_curr = X.copy()
 
         if self.num_layers == 0:
-            # FIX 1: L=0 path — apply one RFF map, then train the head on Phi.
-            # The block has W=None (no SVM projection) and no scaler.
             block, X_curr = self._fit_rff_only_block(X_curr, rng)
             self.blocks_.append(block)
         else:
@@ -145,43 +120,52 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         return float(np.mean(self.predict(X) == y))
 
     # -----------------------------------------------------------------------
-    # Core building blocks
-    # -----------------------------------------------------------------------
 
     def _fit_rff_only_block(self, X: np.ndarray, rng: np.random.Generator):
-        """
-        FIX 1: L=0 baseline block.
-        Applies the RFF (or arc-cosine) feature map but does NOT train SVMs
-        and does NOT project via W.  The head then trains on the P-dimensional Phi.
-        """
+        """FIX 1 + FIX 3: L=0 block. Applies feature map, normalises for arc-cosine."""
         d = X.shape[1]
         gamma = self._median_heuristic(X, rng) if self.kernel == "rbf" else 1.0
         Omega, b = self._sample_frequencies(d, gamma, rng)
         Phi = self._feature_map(X, Omega, b)
+        # FIX 3
+        phi_scaler = None
+        if self.kernel == "arc_cosine":
+            phi_scaler = StandardScaler()
+            Phi = phi_scaler.fit_transform(Phi)
         block = _Block(Omega=Omega, b=b, W=None, kernel=self.kernel,
-                       arc_cosine_degree=self.arc_cosine_degree, scaler=None)
+                       arc_cosine_degree=self.arc_cosine_degree,
+                       scaler=None, phi_scaler=phi_scaler)
         return block, Phi
 
     def _fit_block(self, X, y_enc, C_list, rng):
-        """
-        Train one hidden block and return (block, next_representation).
-        FIX 2: for arc-cosine kernel, standardize X_next before returning.
-        """
+        """FIX 2 + FIX 3: Train one hidden block."""
         d = X.shape[1]
         gamma = self._median_heuristic(X, rng) if self.kernel == "rbf" else 1.0
         Omega, b = self._sample_frequencies(d, gamma, rng)
         Phi = self._feature_map(X, Omega, b)
+
+        # FIX 3: normalise ArcCos Phi before the SVM solve.
+        # max(0,z) features are non-negative with heterogeneous per-feature
+        # variance. Phi^T Phi is ill-conditioned, causing TRON primal to fail
+        # to converge (hits max_iter=5000) from n ~ 5k on MNIST (d=784).
+        # StandardScaler makes features zero-mean unit-variance → good conditioning.
+        phi_scaler = None
+        if self.kernel == "arc_cosine":
+            phi_scaler = StandardScaler()
+            Phi = phi_scaler.fit_transform(Phi)
+
         W = self._train_svm_block(Phi, y_enc, C_list, rng)
         X_next = Phi @ W
 
-        # FIX 2: standardize inter-layer representation for arc-cosine
+        # FIX 2: standardize inter-layer representation
         scaler = None
         if self.kernel == "arc_cosine" and self.normalize_inter_layer:
             scaler = StandardScaler()
             X_next = scaler.fit_transform(X_next)
 
         block = _Block(Omega=Omega, b=b, W=W, kernel=self.kernel,
-                       arc_cosine_degree=self.arc_cosine_degree, scaler=scaler)
+                       arc_cosine_degree=self.arc_cosine_degree,
+                       scaler=scaler, phi_scaler=phi_scaler)
         return block, X_next
 
     def _fit_head(self, X, y_enc, rng):
@@ -199,25 +183,23 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         return np.column_stack(weight_cols)
 
     def _forward_pass(self, X: np.ndarray) -> np.ndarray:
-        """Apply all trained blocks in sequence. Handles both L=0 and L>0."""
+        """Apply all trained blocks. Handles L=0 and L>0, and phi_scaler."""
         X_curr = X
         for block in self.blocks_:
             Phi = self._feature_map(X_curr, block.Omega, block.b,
                                     kernel=block.kernel,
                                     arc_cosine_degree=block.arc_cosine_degree)
+            # FIX 3: apply Phi normalisation if present
+            if block.phi_scaler is not None:
+                Phi = block.phi_scaler.transform(Phi)
             if block.W is None:
-                # L=0 RFF-only block: output is Phi directly
                 X_curr = Phi
             else:
                 X_curr = Phi @ block.W
-                # FIX 2: apply the stored scaler if present
+                # FIX 2: apply inter-layer scaler if present
                 if block.scaler is not None:
                     X_curr = block.scaler.transform(X_curr)
         return X_curr
-
-    # -----------------------------------------------------------------------
-    # Feature map
-    # -----------------------------------------------------------------------
 
     def _feature_map(self, X, Omega, b, kernel=None, arc_cosine_degree=None):
         kernel = kernel or self.kernel
