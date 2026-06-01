@@ -56,7 +56,7 @@ DATASETS = {
     },
 }
 MODELS = [
-    ("Linear SVM",           lambda: make_linear_svm(),                              False),
+    #("Linear SVM",           lambda: make_linear_svm(),                              False),
     ("RBF SVM (exact)",      lambda: make_rbf_svm(),                                 True),
     ("Flat RFF RBF (L=0)",   lambda: make_flat_rff(ML_MSVM, P, "rbf"),              False),
     ("ML-MSVM RBF m=2 L=2",  lambda: make_mlmsvm(ML_MSVM, 2, 2, P, "rbf"),         False),
