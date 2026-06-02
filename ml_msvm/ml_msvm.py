@@ -1,22 +1,27 @@
 """
-ml_msvm.py  –  FIXED VERSION
-=============================
-Bugs fixed vs. original:
-  1. L=0 bug: when num_layers=0, _fit_head() was called on raw X without any
-     RFF feature map. Fixed by applying one RFF block (no SVM, no W) so the
-     final head trains on the P-dimensional feature space as intended.
-  2. Arc-cosine inter-layer standardization: X_next = Phi @ W was passed
-     to the next block raw. For arc-cosine features this causes scale drift
-     across layers (empirically max_abs grows ~5x per layer). Fixed by
-     standardizing X_next to zero mean / unit std after each block when
-     kernel='arc_cosine', using a per-block StandardScaler stored for inference.
+ml_msvm.py
+==========
+MultiLayer Multi-SVM classifier (ML-MSVM, Proposal 2, no AGOP).
 
-These are the ONLY changes to _fit_block, fit, _forward_pass, and the _Block
-dataclass. All other logic is identical to the original.
+Fixes included:
+  1. L=0 baseline block (_fit_rff_only_block): applies the RFF/arc-cosine map
+     and trains the head on the P-dimensional feature space.
+  2. Arc-cosine inter-layer standardisation (normalize_inter_layer): prevents
+     scale drift across arc-cosine blocks.
+  3. Adaptive dual/primal solver selection (_make_svm): chooses the LinearSVC
+     dual formulation when n_samples < n_features and the primal otherwise.
+     This is the manual equivalent of dual='auto' and works on all sklearn
+     versions. It is the key to fast training at every n:
+        n < P  ->  dual   (small dual space)
+        n > P  ->  primal (small primal space)
+
+NOTE: There is intentionally NO StandardScaler applied to Phi before the block
+      SVM. Standardising the non-negative arc-cosine features amplifies rarely
+      active neurons into high-variance noise and makes the solve *slower*.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import numpy as np
@@ -27,20 +32,14 @@ from sklearn.svm import LinearSVC
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 
 
-# ---------------------------------------------------------------------------
-# Data containers
-# ---------------------------------------------------------------------------
-
 @dataclass
 class _Block:
-    """Frozen state of a single feature-extraction block (hidden layer)."""
-    Omega: np.ndarray           # feature frequencies/weights, shape (P, d_in)
-    b: np.ndarray               # RFF phases, shape (P,); zeros for arc-cosine
-    W: Optional[np.ndarray]     # SVM weight matrix, None only for the L=0 RFF block
+    Omega: np.ndarray
+    b: np.ndarray
+    W: Optional[np.ndarray]
     kernel: str
     arc_cosine_degree: int
-    # FIX 2: per-block scaler, fitted on X_next during training, applied at inference
-    scaler: Optional[StandardScaler] = None
+    scaler: Optional[StandardScaler] = None   # inter-layer scaler (arc-cosine only)
 
 
 @dataclass
@@ -49,19 +48,11 @@ class _Head:
     intercept: np.ndarray
 
 
-# ---------------------------------------------------------------------------
-# Classifier
-# ---------------------------------------------------------------------------
-
 class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
     """
-    MultiLayer Multi-SVM classifier (Proposal 2, no AGOP).
-
     Parameters
     ----------
-    num_layers : int
-        Number of feature-extraction blocks.
-        0 -> single RFF map + linear SVM (flat RFF baseline).
+    num_layers : int           0 -> flat RFF SVM baseline.
     svms_per_block : int  (m)
     C_values : sequence of float, optional
     rff_features : int  (P)
@@ -70,10 +61,7 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
     arc_cosine_degree : {0, 1, 2}
     median_heuristic_subsample : int or None
     random_state : int or None
-    normalize_inter_layer : bool
-        If True (default), standardize X_next between arc-cosine blocks.
-        Has no effect for kernel='rbf' (RBF features are already bounded [-1,1]*sqrt(2/P)).
-        Set to False only for ablation studies.
+    normalize_inter_layer : bool   Standardise X_next between arc-cosine blocks.
     """
 
     def __init__(
@@ -115,8 +103,6 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         X_curr = X.copy()
 
         if self.num_layers == 0:
-            # FIX 1: L=0 path — apply one RFF map, then train the head on Phi.
-            # The block has W=None (no SVM projection) and no scaler.
             block, X_curr = self._fit_rff_only_block(X_curr, rng)
             self.blocks_.append(block)
         else:
@@ -145,15 +131,11 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         return float(np.mean(self.predict(X) == y))
 
     # -----------------------------------------------------------------------
-    # Core building blocks
+    # Blocks
     # -----------------------------------------------------------------------
 
     def _fit_rff_only_block(self, X: np.ndarray, rng: np.random.Generator):
-        """
-        FIX 1: L=0 baseline block.
-        Applies the RFF (or arc-cosine) feature map but does NOT train SVMs
-        and does NOT project via W.  The head then trains on the P-dimensional Phi.
-        """
+        """FIX 1: L=0 baseline. Feature map only; head trains on Phi."""
         d = X.shape[1]
         gamma = self._median_heuristic(X, rng) if self.kernel == "rbf" else 1.0
         Omega, b = self._sample_frequencies(d, gamma, rng)
@@ -163,18 +145,15 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         return block, Phi
 
     def _fit_block(self, X, y_enc, C_list, rng):
-        """
-        Train one hidden block and return (block, next_representation).
-        FIX 2: for arc-cosine kernel, standardize X_next before returning.
-        """
+        """Train one hidden block. FIX 2: standardise X_next for arc-cosine."""
         d = X.shape[1]
         gamma = self._median_heuristic(X, rng) if self.kernel == "rbf" else 1.0
         Omega, b = self._sample_frequencies(d, gamma, rng)
         Phi = self._feature_map(X, Omega, b)
+
         W = self._train_svm_block(Phi, y_enc, C_list, rng)
         X_next = Phi @ W
 
-        # FIX 2: standardize inter-layer representation for arc-cosine
         scaler = None
         if self.kernel == "arc_cosine" and self.normalize_inter_layer:
             scaler = StandardScaler()
@@ -185,38 +164,35 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         return block, X_next
 
     def _fit_head(self, X, y_enc, rng):
-        svm = self._make_svm(self.final_C, rng).fit(X, y_enc)
+        svm = self._make_svm(self.final_C, rng, X.shape).fit(X, y_enc)
         return _Head(coef=np.atleast_2d(svm.coef_),
                      intercept=np.atleast_1d(svm.intercept_))
 
     def _train_svm_block(self, Phi, y_enc, C_list, rng):
         weight_cols = []
         for C_k in C_list:
-            svm = self._make_svm(C_k, rng).fit(Phi, y_enc)
+            svm = self._make_svm(C_k, rng, Phi.shape).fit(Phi, y_enc)
             coef = np.atleast_2d(svm.coef_)
             for row in coef:
                 weight_cols.append(row)
         return np.column_stack(weight_cols)
 
     def _forward_pass(self, X: np.ndarray) -> np.ndarray:
-        """Apply all trained blocks in sequence. Handles both L=0 and L>0."""
         X_curr = X
         for block in self.blocks_:
             Phi = self._feature_map(X_curr, block.Omega, block.b,
                                     kernel=block.kernel,
                                     arc_cosine_degree=block.arc_cosine_degree)
             if block.W is None:
-                # L=0 RFF-only block: output is Phi directly
                 X_curr = Phi
             else:
                 X_curr = Phi @ block.W
-                # FIX 2: apply the stored scaler if present
-                if block.scaler is not None:
+                if block.scaler is not None:        # FIX 2
                     X_curr = block.scaler.transform(X_curr)
         return X_curr
 
     # -----------------------------------------------------------------------
-    # Feature map
+    # Feature map and solver
     # -----------------------------------------------------------------------
 
     def _feature_map(self, X, Omega, b, kernel=None, arc_cosine_degree=None):
@@ -247,22 +223,30 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
     def _median_heuristic(self, X, rng):
         n = X.shape[0]
         sub = self.median_heuristic_subsample
-        if sub is not None and n > sub:
-            idx = rng.choice(n, sub, replace=False)
-            X_sub = X[idx]
-        else:
-            X_sub = X
+        X_sub = X[rng.choice(n, sub, replace=False)] if (sub and n > sub) else X
         dists = pdist(X_sub, metric="sqeuclidean")
         med = np.median(dists)
         return 1.0 / (2.0 * med) if med > 0 else 1.0
 
-    def _make_svm(self, C, rng):
+    def _make_svm(self, C, rng, X_shape):
+        """
+        FIX 3: adaptive dual/primal selection (manual dual='auto').
+        Choose the LinearSVC dual formulation when n_samples < n_features,
+        and the primal otherwise. This is fast at every n:
+          n_samples <  n_features -> dual   (small dual space, e.g. n=500, P=1000)
+          n_samples >= n_features -> primal (small primal space, e.g. n=40k, P=1000)
+        Works on all sklearn versions (no reliance on dual='auto').
+        """
         seed = int(rng.integers(0, 2**31))
-        return LinearSVC(C=C, dual=False, max_iter=5000, random_state=seed)
+        n_samples, n_features = X_shape
+        use_dual = n_samples < n_features
+        return LinearSVC(C=C, dual=use_dual, max_iter=5000, random_state=seed)
 
     def _resolve_C_values(self):
         if self.C_values is not None:
             return list(self.C_values)
+        if self.svms_per_block == 1:
+            return [1.0]
         return list(np.logspace(-2, 2, num=self.svms_per_block))
 
     def _check_n_features(self, X):

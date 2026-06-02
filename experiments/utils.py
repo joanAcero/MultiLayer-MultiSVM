@@ -159,10 +159,12 @@ def make_nystroem_svm(P):
     return Pipeline([("scaler",StandardScaler()),
                      ("nystroem",Nystroem(kernel="rbf",n_components=P,gamma=None,random_state=0)),
                      ("svm",LinearSVC(C=1.0,dual=False,max_iter=10_000,random_state=0))])
-def make_mlmsvm(ML_MSVM,L,m,P,kernel,C_values=None,final_C=1.0,seed=0):
-    if C_values is None: C_values=list(np.logspace(-2,1,num=max(m,2)))
-    return pipe(ML_MSVM(num_layers=L,svms_per_block=m,C_values=C_values,
-        rff_features=P,kernel=kernel,arc_cosine_degree=1,final_C=final_C,random_state=seed))
+def make_mlmsvm(ML_MSVM, L, m, P, kernel, C_values=None, final_C=1.0, seed=0):
+    if C_values is None:
+        C_values = [1.0] if m == 1 else list(np.logspace(-2, 1, num=m))
+    return pipe(ML_MSVM(num_layers=L, svms_per_block=m, C_values=C_values,
+        rff_features=P, kernel=kernel, arc_cosine_degree=1,
+        final_C=final_C, random_state=seed))
 def make_flat_rff(ML_MSVM,P,kernel="rbf"):
     return make_mlmsvm(ML_MSVM,0,1,P,kernel)
 
