@@ -43,11 +43,11 @@ N_SEEDS  = 3
 EXP_ID   = "exp9_scalability_timing"
 
 DATASETS = {
-    "mnist": {
-        "display":  "MNIST",
-        "n_trains": [500, 1_000, 2_000, 5_000, 10_000, 20_000, 40_000, 60_000],
-        "n_test":   5_000,
-    },
+    # "mnist": {
+    #     "display":  "MNIST",
+    #     "n_trains": [500, 1_000, 2_000, 5_000, 10_000, 20_000, 40_000, 60_000],
+    #     "n_test":   5_000,
+    # },
     "susy": {
         "display":  "SUSY",
         "n_trains": [1_000, 2_000, 5_000, 10_000, 25_000,

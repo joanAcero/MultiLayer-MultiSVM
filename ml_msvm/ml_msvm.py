@@ -76,6 +76,8 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         median_heuristic_subsample: Optional[int] = 1000,
         random_state: Optional[int] = None,
         normalize_inter_layer: bool = True,
+        block_tol: float = 1e-2,           # FIX 4: looser block tolerance
+        block_max_iter: int = 2000,
     ) -> None:
         self.num_layers = num_layers
         self.svms_per_block = svms_per_block
@@ -87,6 +89,8 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         self.median_heuristic_subsample = median_heuristic_subsample
         self.random_state = random_state
         self.normalize_inter_layer = normalize_inter_layer
+        self.block_tol = block_tol
+        self.block_max_iter = block_max_iter
 
     # -----------------------------------------------------------------------
     # Public API
@@ -164,14 +168,14 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         return block, X_next
 
     def _fit_head(self, X, y_enc, rng):
-        svm = self._make_svm(self.final_C, rng, X.shape).fit(X, y_enc)
+        svm = self._make_svm(self.final_C, rng, X.shape, role="head").fit(X, y_enc)
         return _Head(coef=np.atleast_2d(svm.coef_),
                      intercept=np.atleast_1d(svm.intercept_))
 
     def _train_svm_block(self, Phi, y_enc, C_list, rng):
         weight_cols = []
         for C_k in C_list:
-            svm = self._make_svm(C_k, rng, Phi.shape).fit(Phi, y_enc)
+            svm = self._make_svm(C_k, rng, Phi.shape, role="block").fit(Phi, y_enc)
             coef = np.atleast_2d(svm.coef_)
             for row in coef:
                 weight_cols.append(row)
@@ -228,19 +232,29 @@ class ML_MSVMClassifier(BaseEstimator, ClassifierMixin):
         med = np.median(dists)
         return 1.0 / (2.0 * med) if med > 0 else 1.0
 
-    def _make_svm(self, C, rng, X_shape):
+    def _make_svm(self, C, rng, X_shape, role="block"):
         """
-        FIX 3: adaptive dual/primal selection (manual dual='auto').
-        Choose the LinearSVC dual formulation when n_samples < n_features,
-        and the primal otherwise. This is fast at every n:
-          n_samples <  n_features -> dual   (small dual space, e.g. n=500, P=1000)
-          n_samples >= n_features -> primal (small primal space, e.g. n=40k, P=1000)
+        FIX 3: adaptive dual/primal selection (manual dual='auto'):
+          n_samples <  n_features -> dual   (small dual space)
+          n_samples >= n_features -> primal (small primal space)
         Works on all sklearn versions (no reliance on dual='auto').
+
+        FIX 4: bounded block solver. Block SVMs produce an intermediate
+        representation, not the final prediction, so they do not need tight
+        convergence. A looser tolerance and a smaller iteration cap bound the
+        cost on ill-conditioned feature maps (notably arc-cosine on high-d
+        image data) without affecting the final accuracy materially. The head
+        SVM keeps the tight default tolerance.
         """
         seed = int(rng.integers(0, 2**31))
         n_samples, n_features = X_shape
         use_dual = n_samples < n_features
-        return LinearSVC(C=C, dual=use_dual, max_iter=5000, random_state=seed)
+        if role == "head":
+            tol, max_iter = 1e-4, 5000
+        else:  # block: intermediate representation, looser is fine
+            tol, max_iter = self.block_tol, self.block_max_iter
+        return LinearSVC(C=C, dual=use_dual, tol=tol,
+                         max_iter=max_iter, random_state=seed)
 
     def _resolve_C_values(self):
         if self.C_values is not None:

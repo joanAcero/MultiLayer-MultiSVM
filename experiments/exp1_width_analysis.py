@@ -35,7 +35,7 @@ DATASETS = [
     ("fashion",       "Fashion-MNIST",  3,  5),
 ]
 # Already completed in previous run — skip to save time
-ALREADY_DONE = {"Wine", "Breast Cancer", "Ionosphere", "Sonar"}
+ALREADY_DONE = {"Wine", "Breast Cancer", "Ionosphere", "Sonar", "Spambase", "Magic"}
 
 
 def run(log_path, csv_path):

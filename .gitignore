@@ -1,2 +1,7 @@
 ml_asvm/*
 experiments/logs/*
+
+experiments/data/*
+experiments/results/*
+experiments/results/exp1_width_analysis.csv
+experiments/results/exp9_scalability_timing.csv
