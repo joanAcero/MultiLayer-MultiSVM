@@ -3,5 +3,6 @@ experiments/logs/*
 
 experiments/data/*
 experiments/results/*
-experiments/results/exp1_width_analysis.csv
-experiments/results/exp9_scalability_timing.csv
+full_run2.log
+*.log
+*.pyc

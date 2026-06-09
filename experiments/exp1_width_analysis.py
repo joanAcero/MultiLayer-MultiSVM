@@ -35,8 +35,8 @@ DATASETS = [
     ("fashion",       "Fashion-MNIST",  3,  5),
 ]
 # Already completed in previous run — skip to save time
-ALREADY_DONE = {"Wine", "Breast Cancer", "Ionosphere", "Sonar", "Spambase", "Magic"}
-
+ALREADY_DONE = {"Wine", "Breast Cancer", "Ionosphere", "Sonar",
+                "Glass", "Magic", "Spambase", "Cover Type"}
 
 def run(log_path, csv_path):
     tee = Tee(sys.stdout, log_path)

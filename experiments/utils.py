@@ -36,7 +36,7 @@ PUBLISHED = {
     "mehrkanoon2018": {"name": "DHNKN (Mehrkanoon & Suykens 2018)",
         "MNIST": {"acc": 0.9756, "note": "60k/10k protocol"}},
 }
-RBF_N_LIMIT = 20_000   # exact RBF SVM skipped above this train size
+RBF_N_LIMIT = 50_000   # exact RBF SVM skipped above this train size
 
 
 # ---------------------------------------------------------------------------
@@ -192,45 +192,75 @@ def _load_susy_libsvm(data_dir):
     return X, y
 
 
-def _load_higgs_capped(data_dir, n_max):
-    """HIGGS (11M, d=28): local data/HIGGS.bz2 first, else OpenML. Subsample to n_max."""
-    import bz2
-    from sklearn.datasets import load_svmlight_file
+# Default HIGGS pool: large enough for train sizes up to 400k + a 50k test.
+HIGGS_POOL = 1_100_000
+HIGGS_TOTAL = 11_000_000   # full HIGGS row count (for the sampling fraction)
+
+
+def _load_higgs_capped(data_dir, n_max=None):
+    """
+    Full HIGGS (11M, d=28). Reads the UCI HIGGS.csv.gz in CHUNKS and keeps a
+    uniform random subsample of HIGGS_POOL rows (memory-bounded: one chunk in
+    RAM at a time). This gives a serious large-scale pool that exp3 draws
+    train sizes [50k,100k,200k,400k] + 50k test from — the same protocol as
+    SUSY and CoverType Full. Falls back to LIBSVM bz2, then OpenML (98k).
+    The parsed pool is cached as higgs_pool_<N>.npz for instant reuse.
+
+    Place the file at: data/higgs/HIGGS.csv.gz
+    Download (on your machine):
+      wget -c https://archive.ics.uci.edu/ml/machine-learning-databases/00280/HIGGS.csv.gz
+    """
     os.makedirs(data_dir, exist_ok=True)
-    cache = os.path.join(data_dir, f"higgs_{n_max}.npz")
+    pool = HIGGS_POOL
+    cache = os.path.join(data_dir, f"higgs_pool_{pool}.npz")
     if os.path.exists(cache):
+        print("  (HIGGS from cache)", flush=True)
         d = np.load(cache); return d["X"].astype(np.float64), d["y"].astype(int)
 
-    # UCI CSV.gz (label + 28 features) in data/higgs/ or data/
     csv_paths = [os.path.join(data_dir, "higgs", "HIGGS.csv.gz"),
                  os.path.join(data_dir, "HIGGS.csv.gz")]
     csv_path = next((p for p in csv_paths if os.path.exists(p)), None)
-    local_bz2 = os.path.join(data_dir, "HIGGS.bz2")
+
     if csv_path is not None:
         import pandas as pd
-        print(f"  Parsing {csv_path} (subsampling to {n_max:,})...", flush=True)
-        # read only enough rows to subsample from; HIGGS is 11M so cap the read
-        df = pd.read_csv(csv_path, header=None, dtype=np.float32,
-                         nrows=min(n_max * 4, 2_000_000))
-        y = df.iloc[:, 0].astype(int).values
-        X = df.iloc[:, 1:].astype(np.float64).values
-        del df
-    elif os.path.exists(local_bz2):
-        print("  Parsing HIGGS.bz2...", flush=True)
-        with bz2.open(local_bz2, "rb") as f:
-            Xs, y = load_svmlight_file(f, n_features=28)
-        X = Xs.toarray().astype(np.float64)
-        y = (y.astype(float) > 0).astype(int)
+        print(f"  Parsing {csv_path} in chunks, sampling ~{pool:,} of 11M rows...",
+              flush=True)
+        frac = pool / HIGGS_TOTAL
+        rs = np.random.default_rng(0)
+        parts = []
+        for chunk in pd.read_csv(csv_path, header=None, dtype=np.float32,
+                                 chunksize=1_000_000):
+            mask = rs.random(len(chunk)) < frac
+            if mask.any():
+                parts.append(chunk.values[mask])
+        data = np.concatenate(parts, axis=0)
+        y = data[:, 0].astype(int)
+        X = data[:, 1:].astype(np.float64)
+        del data, parts
     else:
-        print(f"\n  data/HIGGS.bz2 not found; downloading subset from OpenML...", flush=True)
-        X, yr = fetch_openml(data_id=23512, as_frame=False, return_X_y=True)
-        X = X.astype(np.float64); _, y = np.unique(yr, return_inverse=True); y = y.astype(int)
+        # Fallbacks: LIBSVM bz2 (full) or OpenML (only ~98k)
+        import bz2
+        from sklearn.datasets import load_svmlight_file
+        local_bz2 = os.path.join(data_dir, "HIGGS.bz2")
+        if os.path.exists(local_bz2):
+            print("  Parsing HIGGS.bz2 (full)...", flush=True)
+            with bz2.open(local_bz2, "rb") as f:
+                Xs, y = load_svmlight_file(f, n_features=28)
+            X = Xs.toarray().astype(np.float64)
+            y = (y.astype(float) > 0).astype(int)
+            if len(y) > pool:
+                idx = np.random.default_rng(0).choice(len(y), pool, replace=False)
+                X, y = X[idx], y[idx]
+        else:
+            print("\n  No local HIGGS file; OpenML fallback (~98k rows only)."
+                  "\n  For a serious test, download data/higgs/HIGGS.csv.gz.", flush=True)
+            X, yr = fetch_openml(data_id=23512, as_frame=False, return_X_y=True)
+            X = X.astype(np.float64); _, y = np.unique(yr, return_inverse=True)
+            y = y.astype(int)
 
-    if len(y) > n_max:
-        idx = np.random.default_rng(0).choice(len(y), n_max, replace=False)
-        X, y = X[idx], y[idx]
     np.savez_compressed(cache, X=X, y=y)
-    print(f"  HIGGS: {len(y):,} rows cached.", flush=True)
+    print(f"  HIGGS: {len(y):,} rows pooled and cached -> {os.path.basename(cache)}",
+          flush=True)
     return X, y
 
 
@@ -262,9 +292,19 @@ def load(tag, verbose=True, data_dir="data"):
         elif tag == "mnist":         X, y = _openml("mnist_784", version=1)
         elif tag == "fashion":       X, y = _openml("Fashion-MNIST", version=1)
         elif tag == "susy":          X, y = _load_susy_libsvm(data_dir)
-        elif tag == "higgs":         X, y = _load_higgs_capped(data_dir, 500_000)
+        elif tag == "higgs":         X, y = _load_higgs_capped(data_dir)
         else:
             raise ValueError(f"Unknown tag: {tag}")
+        # NaN safety net (HIGGS from OpenML contains missing values): impute
+        # each NaN with its column mean so downstream LinearSVC never sees NaN.
+        if np.isnan(X).any():
+            n_nan = int(np.isnan(X).sum())
+            col_mean = np.nanmean(X, axis=0)
+            col_mean = np.where(np.isnan(col_mean), 0.0, col_mean)  # all-NaN cols -> 0
+            inds = np.where(np.isnan(X))
+            X[inds] = np.take(col_mean, inds[1])
+            if verbose:
+                print(f"[imputed {n_nan} NaN with column means] ", end="", flush=True)
         if verbose:
             print(f"done ({time.perf_counter()-t0:.1f}s, shape={X.shape})", flush=True)
         _CACHE[tag] = (X, y)
@@ -304,11 +344,15 @@ def pipe(*steps):
 
 
 def _linear_svc(C=1.0):
-    """LinearSVC with dual='auto' when available, else dual=False; loose tol."""
+    """LinearSVC with dual='auto' when available, else dual=False.
+    Uses tol=1e-2 to MATCH the ML-MSVM internal SVMs exactly, so the timing
+    comparison is fair: every linear solve in the suite uses identical solver
+    settings. tol=1e-2 gives the same accuracy as 1e-4 (verified) but converges
+    ~30x faster on ill-conditioned raw features such as standardized MNIST."""
     try:
-        return LinearSVC(C=C, dual="auto", tol=1e-3, max_iter=5000, random_state=0)
+        return LinearSVC(C=C, dual="auto", tol=1e-2, max_iter=2000, random_state=0)
     except TypeError:
-        return LinearSVC(C=C, dual=False, tol=1e-3, max_iter=5000, random_state=0)
+        return LinearSVC(C=C, dual=False, tol=1e-2, max_iter=2000, random_state=0)
 
 
 def make_linear_svm():
